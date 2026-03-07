@@ -332,6 +332,214 @@ async def _gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         return True
 
     text = (
+        f"👋 Hello *{user.first_name}*!\n\n"
+        f"To use *Stain Temp Mail Service* you must join our channel first.\n\n"
+        f"1️⃣ Tap the button below to join\n"
+        f"2️⃣ Come back and tap *I\'ve joined*"
+    )
+    await msg.reply_text(text, parse_mode="Markdown", reply_markup=_join_keyboard())
+    return False
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  COMMAND HANDLERS
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    # Show join gate if not a member; gate() sends the prompt itself
+    if not await _is_member(user.id, context.bot):
+        text = (
+            f"👋 Hello *{user.first_name}*!\n\n"
+            f"To use *Stain Temp Mail Service* you must join our channel first.\n\n"
+            f"1️⃣ Tap the button below to join\n"
+            f"2️⃣ Come back and tap *I\'ve joined*"
+        )
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=_join_keyboard())
+        return
+    text = (
+        f"👋 Hello *{user.first_name}*, welcome to *Stain Temp Mail Service*.\n\n"
+        f"Use the available commands below to get started:\n\n"
+        f"📧 /new — Generate a temporary email address\n"
+        f"📬 /check — Check inbox for new emails\n"
+        f"📖 /read `N` — Read message number N in full\n"
+        f"🗑 /delete — Discard your current address\n"
+        f"🆘 /support — Get help\n"
+        f"ℹ️ /help — Show this message"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start(update, context)
+
+
+async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🆘 *Support*\n\n"
+        "Need help? Reach out:\n\n"
+        "💬 Telegram: https://t.me/heisevanss\n"
+        "🔗 Links: https://linktr.ee/iamevanss"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def new_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show service picker."""
+    if not await _gate(update, context): return
+    text = (
+        "📮 *Choose your email service:*\n\n"
+        "Each service creates a real, working inbox.\n"
+        "Tap one to generate your address instantly."
+    )
+    msg = update.message or (update.callback_query and update.callback_query.message)
+    await msg.reply_text(text, parse_mode="Markdown", reply_markup=_service_picker())
+
+
+async def check_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg  = update.message or update.callback_query.message
+    box  = inboxes.get(user.id)
+
+    if not box:
+        await msg.reply_text(
+            "❌ You don't have an active inbox yet.\nUse /new to create one.",
+            reply_markup=_inbox_keyboard()
+        )
+        return
+
+    await msg.reply_text("⏳ Checking inbox...")
+
+    try:
+        messages = await list_messages(box)
+    except Exception as e:
+        logger.warning(f"list_messages error: {e}")
+        await msg.reply_text("❌ Couldn't reach the mail service. Try again in a moment.")
+        return
+
+    if not messages:
+        text = (
+            f"📭 *Inbox empty*\n\n"
+            f"📧 {_fmt_address(user.id)}\n\n"
+            f"No messages yet. Emails can take up to 30 seconds to arrive."
+        )
+    else:
+        lines = [f"📬 *{len(messages)} message(s)* in your inbox:\n"]
+        for i, m in enumerate(messages, 1):
+            subject = m.get("subject") or "(no subject)"
+            sender  = m.get("from", "unknown")
+            date    = m.get("date", "")
+            lines.append(f"*{i}.* 📩 {subject}\n    From: `{sender}`\n    {date}")
+        lines.append("\n👉 Use /read `N` to read a message (e.g. `/read 1`)")
+        text = "\n\n".join(lines)
+
+    context.user_data["last_messages"] = messages
+    await msg.reply_text(text, parse_mode="Markdown", reply_markup=_inbox_keyboard())
+
+
+async def read_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _gate(update, context): return
+    user = update.effective_user
+    box  = inboxes.get(user.id)
+
+    if not box:
+        await update.message.reply_text("❌ No active inbox. Use /new first.")
+        return
+
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text(
+            "Usage: /read `N` — e.g. `/read 1`", parse_mode="Markdown"
+        )
+        return
+
+    idx      = int(args[0]) - 1
+    messages = context.user_data.get("last_messages")
+
+    if not messages:
+        await update.message.reply_text("📭 Please run /check first to load your inbox.")
+        return
+
+    if idx < 0 or idx >= len(messages):
+        await update.message.reply_text(f"❌ Invalid number. You have {len(messages)} message(s).")
+        return
+
+    msg_id = messages[idx]["id"]
+    await update.message.reply_text("⏳ Loading message...")
+
+    try:
+        full = await read_message_full(box, msg_id)
+    except Exception as e:
+        logger.warning(f"read_message_full error: {e}")
+        await update.message.reply_text("❌ Couldn't load message. Try again.")
+        return
+
+    if not full:
+        await update.message.reply_text("❌ Message not found.")
+        return
+
+    subject = full.get("subject") or "(no subject)"
+    sender  = full.get("from", "unknown")
+    date    = full.get("date", "")
+    body    = full.get("textBody") or "(empty body)"
+    body    = re.sub(r"<[^>]+>", "", body).strip()
+
+    if len(body) > 3500:
+        body = body[:3500] + "\n\n... _(message truncated)_"
+
+    text = (
+        f"📩 *{subject}*\n"
+        f"From: `{sender}`\n"
+        f"Date: {date}\n"
+        f"{'─' * 30}\n\n"
+        f"{body}"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=_inbox_keyboard())
+
+
+async def delete_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _gate(update, context): return
+    user = update.effective_user
+    msg  = update.message or update.callback_query.message
+
+    if user.id in inboxes:
+        del inboxes[user.id]
+        context.user_data.pop("last_messages", None)
+        await msg.reply_text(
+            "🗑 *Inbox deleted.*\n\nUse /new to generate a fresh address.",
+            parse_mode="Markdown"
+        )
+    else:
+        await msg.reply_text("❌ No active inbox to delete.")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CALLBACK HANDLER
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user   = update.effective_user
+    action = query.data
+
+    # ── Service selection ────────────────────────────────────────────────────
+    if action.startswith("svc_"):
+        service = action.replace("svc_", "")
+        label   = SERVICE_LABELS.get(service, service)
+
+        await query.edit_message_text(
+            f"⏳ Creating your *{label}* inbox...",
+            parse_mode="Markdown"
+        )
+
+        try:
+            box = await create_inbox(service)
+            box["created"] = datetime.now()
+            in    if await _is_member(user.id, context.bot):
+        return True
+
+    text = (
         f"👋 Hello *{user.first_name}*!
 
 "
